@@ -7,6 +7,8 @@ import {
   Clock,
   Download,
   FileText,
+  Loader2,
+  Play,
   Scale,
   Search,
 } from 'lucide-react';
@@ -22,8 +24,10 @@ interface BatchReconciliationTabProps {
   transactions: FleetTransaction[];
   auditData: BatchAuditResponse | null;
   isAuditing: boolean;
+  auditingTxnIds: string[];
   auditError: string | null;
   onRunAudit: () => void;
+  onRunSingleRowAudit: (txn: FleetTransaction) => void;
   onInspectCitation: (chunkId: string) => void;
   onGenerateDisputePacket: (txn: FleetTransaction, audit: RowAuditResult) => void;
 }
@@ -42,8 +46,10 @@ export function BatchReconciliationTab({
   transactions,
   auditData,
   isAuditing,
+  auditingTxnIds,
   auditError,
   onRunAudit,
+  onRunSingleRowAudit,
   onInspectCitation,
   onGenerateDisputePacket,
 }: BatchReconciliationTabProps) {
@@ -216,7 +222,7 @@ export function BatchReconciliationTab({
         {auditData && (
           <div className="flex items-center gap-4 text-xs text-slate-500">
             <span className="font-mono tabular-nums">
-              Audited in {(auditData.latency_ms / 1000).toFixed(2)}s
+              {auditData.model} · {(auditData.latency_ms / 1000).toFixed(2)}s
             </span>
             <button
               type="button"
@@ -392,6 +398,7 @@ export function BatchReconciliationTab({
                   ))
                 : filteredTransactions.map((txn) => {
                     const audit = auditMap.get(txn.txn_id);
+                    const isRowAuditing = auditingTxnIds.includes(txn.txn_id);
                     const isExpanded = expandedTxnId === txn.txn_id;
                     const isFlagged =
                       audit &&
@@ -470,7 +477,12 @@ export function BatchReconciliationTab({
                           </td>
 
                           <td className="py-3 px-3 align-top">
-                            {audit ? (
+                            {isRowAuditing ? (
+                              <span className="inline-flex items-center gap-1.5 text-xs text-[#1E3A8A] font-medium whitespace-nowrap">
+                                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                <span>Auditing row...</span>
+                              </span>
+                            ) : audit ? (
                               <div className="space-y-1">
                                 {renderClassification(audit.classification)}
                                 {audit.chargeback_code && audit.chargeback_code !== 'N/A' && (
@@ -485,7 +497,9 @@ export function BatchReconciliationTab({
                           </td>
 
                           <td className="py-3 px-3 align-top whitespace-nowrap">
-                            {audit ? (
+                            {isRowAuditing ? (
+                              <div className="h-5 w-16 bg-slate-200 rounded animate-pulse" />
+                            ) : audit ? (
                               <div className="flex flex-wrap items-center gap-1.5">
                                 {audit.cited_chunks.map((cid) => (
                                   <button
@@ -505,7 +519,9 @@ export function BatchReconciliationTab({
                           </td>
 
                           <td className="py-3 pl-3 pr-4 align-top text-right whitespace-nowrap">
-                            {audit && isFlagged ? (
+                            {isRowAuditing ? (
+                              <span className="text-slate-400">Running RAG...</span>
+                            ) : audit && isFlagged ? (
                               <button
                                 type="button"
                                 onClick={() => onGenerateDisputePacket(txn, audit)}
@@ -517,7 +533,14 @@ export function BatchReconciliationTab({
                             ) : audit ? (
                               <span className="text-slate-400">No dispute needed</span>
                             ) : (
-                              <span className="text-slate-400">—</span>
+                              <button
+                                type="button"
+                                onClick={() => onRunSingleRowAudit(txn)}
+                                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-md hover:border-[#1E3A8A] hover:text-[#1E3A8A] transition-colors whitespace-nowrap shrink-0"
+                              >
+                                <Play className="w-3 h-3" />
+                                <span>Audit Row</span>
+                              </button>
                             )}
                           </td>
                         </tr>
@@ -574,16 +597,26 @@ export function BatchReconciliationTab({
                               ) : (
                                 <div className="flex items-center justify-between gap-4 text-xs text-slate-600">
                                   <span>
-                                    Corridor: {txn.corridor_note} · RRN {txn.rrn}. Run AI RAG Batch
-                                    Audit to evaluate policy compliance and retrieve governing
-                                    clauses.
+                                    Corridor: {txn.corridor_note} · RRN {txn.rrn}. Audit just{' '}
+                                    <span className="font-mono font-semibold text-slate-900">
+                                      {txn.txn_id}
+                                    </span>{' '}
+                                    against indexed NPCI / 1Pay policies.
                                   </span>
                                   <button
                                     type="button"
-                                    onClick={onRunAudit}
-                                    className="px-3 py-1.5 font-medium text-white bg-[#1E3A8A] rounded-md hover:bg-[#1E40AF] transition-colors whitespace-nowrap shrink-0"
+                                    onClick={() => onRunSingleRowAudit(txn)}
+                                    disabled={isRowAuditing}
+                                    className="inline-flex items-center gap-1.5 px-3 py-1.5 font-medium text-white bg-[#1E3A8A] rounded-md hover:bg-[#1E40AF] disabled:opacity-55 transition-colors whitespace-nowrap shrink-0"
                                   >
-                                    Run AI RAG Batch Audit
+                                    {isRowAuditing ? (
+                                      <>
+                                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                        <span>Auditing {txn.txn_id}...</span>
+                                      </>
+                                    ) : (
+                                      <span>Audit {txn.txn_id} Only</span>
+                                    )}
                                   </button>
                                 </div>
                               )}

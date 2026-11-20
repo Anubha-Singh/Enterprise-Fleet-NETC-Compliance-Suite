@@ -38,6 +38,7 @@ import {
   runBatchAuditApi,
   runEvalSuiteApi,
   runRagQueryApi,
+  runSingleRowAuditApi,
 } from './utils/api';
 
 type ActiveTab = 'batch' | 'sandbox' | 'evals';
@@ -79,6 +80,7 @@ export default function App() {
   // Tab 1: Batch Audit state
   const [auditData, setAuditData] = useState<BatchAuditResponse | null>(null);
   const [isAuditing, setIsAuditing] = useState(false);
+  const [auditingTxnIds, setAuditingTxnIds] = useState<string[]>([]);
   const [auditError, setAuditError] = useState<string | null>(null);
 
   // Dispute Packet modal state
@@ -125,6 +127,37 @@ export default function App() {
       setAuditError(err instanceof Error ? err.message : 'Batch audit request failed.');
     } finally {
       setIsAuditing(false);
+    }
+  };
+
+  const handleRunSingleRowAudit = async (txn: FleetTransaction) => {
+    if (auditingTxnIds.includes(txn.txn_id)) return;
+    setAuditingTxnIds((prev) => [...prev, txn.txn_id]);
+    setAuditError(null);
+    try {
+      const response = await runSingleRowAuditApi({
+        transaction: txn,
+        allTransactions: MOCK_FLEET_TRANSACTIONS,
+        chunks: policyChunks,
+        client_name: CLIENT_PROFILE.company_name,
+      });
+      setAuditData((prev) => {
+        const existing = prev?.results.filter((r) => r.txn_id !== txn.txn_id) ?? [];
+        return {
+          batch_id: prev?.batch_id ?? CLIENT_PROFILE.batch_id,
+          client_name: prev?.client_name ?? CLIENT_PROFILE.company_name,
+          model: response.model,
+          latency_ms: response.latency_ms,
+          audited_at: response.audited_at,
+          results: [...existing, response.result],
+        };
+      });
+    } catch (err) {
+      setAuditError(
+        err instanceof Error ? err.message : `Single-row audit failed for ${txn.txn_id}.`
+      );
+    } finally {
+      setAuditingTxnIds((prev) => prev.filter((id) => id !== txn.txn_id));
     }
   };
 
@@ -422,8 +455,10 @@ export default function App() {
               transactions={MOCK_FLEET_TRANSACTIONS}
               auditData={auditData}
               isAuditing={isAuditing}
+              auditingTxnIds={auditingTxnIds}
               auditError={auditError}
               onRunAudit={handleRunBatchAudit}
+              onRunSingleRowAudit={handleRunSingleRowAudit}
               onInspectCitation={handleInspectCitation}
               onGenerateDisputePacket={handleGenerateDisputePacket}
             />

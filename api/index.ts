@@ -13,8 +13,68 @@ import type {
   RowAuditResult,
 } from '../src/types/compliance';
 
-const TEXT_MODEL = 'gemini-4-hydrogen';
+const PRIMARY_TEXT_MODEL = 'gemini-4-hydrogen';
+const FALLBACK_TEXT_MODEL = 'gemini-3.1-flash-lite';
 const EMBEDDING_MODEL = 'gemini-embedding-2';
+
+function isTransientError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /503|UNAVAILABLE|overloaded|high demand|500|INTERNAL|429|RESOURCE_EXHAUSTED|ECONNRESET|ETIMEDOUT|fetch failed/i.test(
+    msg
+  );
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function generateWithFallback(
+  ai: GoogleGenAI,
+  params: {
+    contents: string;
+    systemInstruction: string;
+    responseSchema: Record<string, unknown>;
+  }
+): Promise<{ text: string; modelUsed: string }> {
+  const models: Array<{ name: string; thinkingLevel: ThinkingLevel }> = [
+    { name: PRIMARY_TEXT_MODEL, thinkingLevel: ThinkingLevel.LOW },
+    { name: FALLBACK_TEXT_MODEL, thinkingLevel: ThinkingLevel.MINIMAL },
+  ];
+
+  let lastError: unknown;
+
+  for (let mIdx = 0; mIdx < models.length; mIdx++) {
+    const { name, thinkingLevel } = models[mIdx];
+    const maxAttempts = 2;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const response = await ai.models.generateContent({
+          model: name,
+          contents: params.contents,
+          config: {
+            thinkingConfig: { thinkingLevel },
+            systemInstruction: params.systemInstruction,
+            responseMimeType: 'application/json',
+            responseSchema: params.responseSchema,
+          },
+        });
+        const label = mIdx === 0 ? name : `${name} (fallback)`;
+        return { text: (response.text ?? '{}').trim(), modelUsed: label };
+      } catch (err) {
+        lastError = err;
+        if (!isTransientError(err)) {
+          throw err;
+        }
+        if (attempt < maxAttempts) {
+          await sleep(500 * attempt);
+        }
+      }
+    }
+  }
+
+  throw lastError;
+}
 
 function getGenAIClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -107,35 +167,46 @@ function computeLexicalScore(query: string, chunk: PolicyChunk): number {
 
 async function embedTexts(ai: GoogleGenAI, texts: string[]): Promise<number[][]> {
   if (texts.length === 0) return [];
-  const response = await ai.models.embedContent({
-    model: EMBEDDING_MODEL,
-    contents: texts,
-  });
-  const embeddings = response.embeddings ?? [];
-  return embeddings.map((item) => item.values ?? []);
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const response = await ai.models.embedContent({
+        model: EMBEDDING_MODEL,
+        contents: texts,
+      });
+      const embeddings = response.embeddings ?? [];
+      return embeddings.map((item) => item.values ?? []);
+    } catch (err) {
+      lastError = err;
+      if (!isTransientError(err) || attempt === 3) {
+        throw err;
+      }
+      await sleep(450 * attempt);
+    }
+  }
+  throw lastError;
 }
 
-async function retrieveRankedChunks(
-  ai: GoogleGenAI,
-  query: string,
-  chunks: PolicyChunk[]
-): Promise<RetrievedChunkScore[]> {
+async function ensureChunkEmbeddings(ai: GoogleGenAI, chunks: PolicyChunk[]): Promise<void> {
   const missingChunks = chunks.filter((chunk) => !embeddingCache.has(chunkCacheKey(chunk)));
-  const textsToEmbed: string[] = [
-    query,
-    ...missingChunks.map((c) => `[${c.chunk_id} | ${c.source_doc} ${c.section}] ${c.title}: ${c.content}`),
-  ];
-
-  const vectors = await embedTexts(ai, textsToEmbed);
-  const queryVector = vectors[0] ?? [];
-
+  if (missingChunks.length === 0) return;
+  const vectors = await embedTexts(
+    ai,
+    missingChunks.map((c) => `[${c.chunk_id} | ${c.source_doc} ${c.section}] ${c.title}: ${c.content}`)
+  );
   missingChunks.forEach((chunk, idx) => {
-    const vec = vectors[idx + 1];
+    const vec = vectors[idx];
     if (vec && vec.length > 0) {
       embeddingCache.set(chunkCacheKey(chunk), vec);
     }
   });
+}
 
+function scoreChunksWithQueryVector(
+  query: string,
+  queryVector: number[],
+  chunks: PolicyChunk[]
+): RetrievedChunkScore[] {
   const scored: RetrievedChunkScore[] = chunks.map((chunk) => {
     const chunkVec = embeddingCache.get(chunkCacheKey(chunk)) ?? [];
     const rawCosine = cosineSimilarity(queryVector, chunkVec);
@@ -159,6 +230,26 @@ async function retrieveRankedChunks(
   });
 
   return scored.sort((a, b) => b.combined_score - a.combined_score);
+}
+
+async function retrieveRankedChunks(
+  ai: GoogleGenAI,
+  query: string,
+  chunks: PolicyChunk[]
+): Promise<RetrievedChunkScore[]> {
+  await ensureChunkEmbeddings(ai, chunks);
+  const [queryVector = []] = await embedTexts(ai, [query]);
+  return scoreChunksWithQueryVector(query, queryVector, chunks);
+}
+
+async function retrieveRankedChunksBatch(
+  ai: GoogleGenAI,
+  queries: string[],
+  chunks: PolicyChunk[]
+): Promise<RetrievedChunkScore[][]> {
+  await ensureChunkEmbeddings(ai, chunks);
+  const queryVectors = await embedTexts(ai, queries);
+  return queries.map((q, idx) => scoreChunksWithQueryVector(q, queryVectors[idx] ?? [], chunks));
 }
 
 function buildTransactionRetrievalQuery(
@@ -210,50 +301,45 @@ async function runSingleRagQuery(
     )
     .join('\n\n');
 
-  const response = await ai.models.generateContent({
-    model: TEXT_MODEL,
+  const { text, modelUsed } = await generateWithFallback(ai, {
     contents: `Policy Compliance Question:\n${query}\n\nRetrieved Policy Chunks:\n${kbContextBlock}`,
-    config: {
-      thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-      systemInstruction: `You are a strict NPCI NETC & 1Pay Enterprise B2B Fleet Compliance RAG Engine.
+    systemInstruction: `You are a strict NPCI NETC & 1Pay Enterprise B2B Fleet Compliance RAG Engine.
 CRITICAL GROUNDING RULES:
 1. Answer ONLY using facts explicitly stated in the provided Retrieved Policy Chunks.
 2. NEVER invent, assume, or extrapolate rules, monetary caps, timelines, or policy clauses not explicitly written in the chunks.
 3. If the question asks about a topic, policy, fee, customs rule, or workflow that is NOT covered by the retrieved chunks, you MUST set "grounded" to false, set "cited_chunk_ids" to an empty array [], and write a concise refusal stating that the indexed NPCI NETC & 1Pay Knowledge Base does not contain a governing policy for this query (do NOT include any [DOC-XXX] tags in a refusal).
 4. When "grounded" is true, every factual statement MUST cite its source inline in exact bracket format such as [DOC-101], [DOC-102], etc., and list those exact IDs in "cited_chunk_ids".
 5. Keep answers crisp, authoritative, and formatted for B2B finance/operations officers.`,
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: Type.OBJECT,
-        properties: {
-          grounded: {
-            type: Type.BOOLEAN,
-            description:
-              'True only if the retrieved chunks explicitly answer the question; false if out-of-scope or missing from the knowledge base.',
-          },
-          answer: {
-            type: Type.STRING,
-            description:
-              'Strictly cited compliance answer with inline [DOC-XXX] references, or a clear refusal with zero citations if ungrounded.',
-          },
-          cited_chunk_ids: {
-            type: Type.ARRAY,
-            items: { type: Type.STRING },
-            description:
-              'Exact chunk_ids cited in the answer (e.g., ["DOC-102"]). Empty array if grounded is false.',
-          },
-          confidence_note: {
-            type: Type.STRING,
-            description:
-              'One concise sentence summarizing grounding verification and chunk coverage.',
-          },
+    responseSchema: {
+      type: Type.OBJECT,
+      properties: {
+        grounded: {
+          type: Type.BOOLEAN,
+          description:
+            'True only if the retrieved chunks explicitly answer the question; false if out-of-scope or missing from the knowledge base.',
         },
-        required: ['grounded', 'answer', 'cited_chunk_ids', 'confidence_note'],
+        answer: {
+          type: Type.STRING,
+          description:
+            'Strictly cited compliance answer with inline [DOC-XXX] references, or a clear refusal with zero citations if ungrounded.',
+        },
+        cited_chunk_ids: {
+          type: Type.ARRAY,
+          items: { type: Type.STRING },
+          description:
+            'Exact chunk_ids cited in the answer (e.g., ["DOC-102"]). Empty array if grounded is false.',
+        },
+        confidence_note: {
+          type: Type.STRING,
+          description:
+            'One concise sentence summarizing grounding verification and chunk coverage.',
+        },
       },
+      required: ['grounded', 'answer', 'cited_chunk_ids', 'confidence_note'],
     },
   });
 
-  const parsed = JSON.parse((response.text ?? '{}').trim()) as {
+  const parsed = JSON.parse(text) as {
     grounded: boolean;
     answer: string;
     cited_chunk_ids: string[];
@@ -268,7 +354,7 @@ CRITICAL GROUNDING RULES:
     confidence_note: parsed.confidence_note ?? '',
     retrieved_chunks: rankedChunks,
     latency_ms: Date.now() - start,
-    model: TEXT_MODEL,
+    model: modelUsed,
   };
 }
 
@@ -305,6 +391,132 @@ apiRouter.get('/health', (_req, res) => {
   });
 });
 
+const AUDIT_SYSTEM_INSTRUCTION = `You are the 1Pay Enterprise Fleet Reconciliation & NPCI NETC Compliance Auditor.
+Audit every transaction strictly against the provided Knowledge Base chunks:
+- Use ONLY these 4 classifications: COMPLIANT, DISPUTE_ELIGIBLE, POLICY_VIOLATION, HOLD_PENDING.
+- Classification guidance grounded in the KB:
+  * Duplicate settled toll debit within 10 minutes at same plaza for same vehicle with distinct RRNs (the second/duplicate leg) -> DISPUTE_ELIGIBLE, cite DOC-101, chargeback_code: "NETC-DUP-01", dispute_actionable: true. (The first original normal toll leg is COMPLIANT, citing DOC-101 or DOC-102 as verified primary debit.)
+  * Annual Pass applied on State Highway (SH), municipal parking, or private expressway -> POLICY_VIOLATION, cite DOC-102, chargeback_code: "NETC-PASS-EXCL", dispute_actionable: true (requires wallet re-billing / SLA adjustment packet).
+  * Exception Code 08 (E-Notice / Blacklist) 2x penalty -> POLICY_VIOLATION, cite DOC-103, chargeback_code: "NETC-EX08-BLOCKED", dispute_actionable: true (packet explains regularization prerequisite before any dispute).
+  * Corporate fuel card swipe > ₹5,000 with GST invoice AND within 25 km on-route -> COMPLIANT, cite DOC-104, chargeback_code: "N/A", dispute_actionable: false.
+  * Corporate fuel card swipe > ₹5,000 off-corridor (>25 km) and/or missing GST invoice -> POLICY_VIOLATION, cite DOC-104, chargeback_code: "1PAY-SLA-FUEL-HOLD", dispute_actionable: true (Fleet Admin hold & compliance memo).
+  * Settlement status PENDING -> HOLD_PENDING, cite DOC-106, chargeback_code: "HOLD-UNSETTLED", dispute_actionable: true (pre-arbitration hold memo blocking chargeback until POSTED).
+  * Normal settled NH toll -> COMPLIANT, cite DOC-102 (valid NH toll) or DOC-106 (settled POSTED status), chargeback_code: "N/A", dispute_actionable: false.
+- Every single row MUST have a valid primary_citation matching an exact chunk_id from the Knowledge Base (e.g., "DOC-101") and non-empty cited_chunks array.
+- Keep rationale concise (1-2 sharp sentences) and strictly grounded in the cited policy text.`;
+
+const AUDIT_ROW_ITEM_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    txn_id: { type: Type.STRING },
+    classification: {
+      type: Type.STRING,
+      enum: ['COMPLIANT', 'DISPUTE_ELIGIBLE', 'POLICY_VIOLATION', 'HOLD_PENDING'],
+    },
+    primary_citation: { type: Type.STRING },
+    cited_chunks: {
+      type: Type.ARRAY,
+      items: { type: Type.STRING },
+    },
+    chargeback_code: { type: Type.STRING },
+    rationale: { type: Type.STRING },
+    recommended_action: { type: Type.STRING },
+    dispute_actionable: { type: Type.BOOLEAN },
+  },
+  required: [
+    'txn_id',
+    'classification',
+    'primary_citation',
+    'cited_chunks',
+    'chargeback_code',
+    'rationale',
+    'recommended_action',
+    'dispute_actionable',
+  ],
+};
+
+// POST /api/audit-row — Runs RAG retrieval + Gemini structured audit for ONE single transaction
+apiRouter.post('/audit-row', async (req, res) => {
+  const start = Date.now();
+  try {
+    const { transaction, allTransactions, chunks, client_name } = req.body as {
+      transaction: FleetTransaction;
+      allTransactions?: FleetTransaction[];
+      chunks: PolicyChunk[];
+      client_name?: string;
+    };
+
+    if (!transaction || !Array.isArray(chunks)) {
+      res.status(400).json({ error: 'transaction and chunks are required.' });
+      return;
+    }
+
+    const ai = getGenAIClient();
+    const contextTxns = Array.isArray(allTransactions) ? allTransactions : [transaction];
+    const query = buildTransactionRetrievalQuery(transaction, contextTxns);
+    const ranked = await retrieveRankedChunks(ai, query, chunks);
+
+    const siblings = contextTxns.filter(
+      (other) =>
+        other.txn_id !== transaction.txn_id &&
+        other.vehicle_reg === transaction.vehicle_reg &&
+        other.plaza_or_merchant === transaction.plaza_or_merchant
+    );
+
+    const siblingContext =
+      siblings.length > 0
+        ? `\nRelated Counterpart Transaction(s) in Same Batch:\n${siblings
+            .map(
+              (s) =>
+                `${s.txn_id} | Vehicle: ${s.vehicle_reg} | Plaza: ${s.plaza_or_merchant} | Amount: ₹${s.amount_inr} | Status: ${s.settlement_status} | Time: ${s.timestamp} | RRN: ${s.rrn} | Notes: ${s.notes}`
+            )
+            .join('\n')}`
+        : '';
+
+    const kbBlock = chunks
+      .map((c) => `[${c.chunk_id} | ${c.source_doc} ${c.section}] ${c.title}: ${c.content}`)
+      .join('\n');
+
+    const topMatches = ranked
+      .slice(0, 3)
+      .map((m) => `${m.chunk_id} (${(m.combined_score * 100).toFixed(0)}%)`)
+      .join(', ');
+
+    const rowLine = `${transaction.txn_id} | Vehicle: ${transaction.vehicle_reg} | Plaza/Merchant: ${transaction.plaza_or_merchant} | Category: ${transaction.category} | Amount: ₹${transaction.amount_inr} | Status: ${transaction.settlement_status} | Time: ${transaction.timestamp} | RRN: ${transaction.rrn} | Corridor: ${transaction.corridor_note} | Notes: ${transaction.notes} | Top Retrieved Policies: [${topMatches}]`;
+
+    const { text, modelUsed } = await generateWithFallback(ai, {
+      contents: `Embedded Knowledge Base:\n${kbBlock}\n\nSingle Transaction to Audit for ${client_name ?? 'Apex Freight Carriers Pvt Ltd'}:\n${rowLine}${siblingContext}\n\nAudit ONLY transaction ${transaction.txn_id} and return the exact structured classification.`,
+      systemInstruction: AUDIT_SYSTEM_INSTRUCTION,
+      responseSchema: AUDIT_ROW_ITEM_SCHEMA,
+    });
+
+    const parsed = JSON.parse(text) as Omit<RowAuditResult, 'retrieved_chunks'>;
+    const validChunkIds = new Set(chunks.map((c) => c.chunk_id));
+    const sanitizedCitations = (parsed.cited_chunks ?? []).filter((id) => validChunkIds.has(id));
+    const primary = validChunkIds.has(parsed.primary_citation)
+      ? parsed.primary_citation
+      : sanitizedCitations[0] ?? ranked[0]?.chunk_id ?? 'DOC-101';
+
+    const result: RowAuditResult = {
+      ...parsed,
+      txn_id: transaction.txn_id,
+      primary_citation: primary,
+      cited_chunks: sanitizedCitations.length > 0 ? sanitizedCitations : [primary],
+      retrieved_chunks: ranked.slice(0, 3),
+    };
+
+    res.json({
+      result,
+      model: modelUsed,
+      latency_ms: Date.now() - start,
+      audited_at: new Date().toISOString(),
+    });
+  } catch (err) {
+    const formatted = formatApiError(err);
+    res.status(formatted.status).json({ error: formatted.message });
+  }
+});
+
 // POST /api/audit-batch — Runs RAG retrieval + Gemini structured audit across all 8 rows
 apiRouter.post('/audit-batch', async (req, res) => {
   const start = Date.now();
@@ -323,16 +535,12 @@ apiRouter.post('/audit-batch', async (req, res) => {
 
     const ai = getGenAIClient();
 
-    const perRowRetrievals = await Promise.all(
-      transactions.map(async (txn) => {
-        const query = buildTransactionRetrievalQuery(txn, transactions);
-        const ranked = await retrieveRankedChunks(ai, query, chunks);
-        return { txn_id: txn.txn_id, ranked };
-      })
-    );
+    // Batch all transaction queries into a single embedContent call to avoid rate limits / 503 spikes
+    const queries = transactions.map((txn) => buildTransactionRetrievalQuery(txn, transactions));
+    const batchRanked = await retrieveRankedChunksBatch(ai, queries, chunks);
 
     const retrievalMap = new Map<string, RetrievedChunkScore[]>(
-      perRowRetrievals.map((entry) => [entry.txn_id, entry.ranked])
+      transactions.map((txn, idx) => [txn.txn_id, batchRanked[idx] ?? []])
     );
 
     const kbBlock = chunks
@@ -349,67 +557,22 @@ apiRouter.post('/audit-batch', async (req, res) => {
       })
       .join('\n');
 
-    const response = await ai.models.generateContent({
-      model: TEXT_MODEL,
+    const { text, modelUsed } = await generateWithFallback(ai, {
       contents: `Embedded Knowledge Base:\n${kbBlock}\n\nB2B Settlement Batch for ${client_name ?? 'Apex Freight Carriers Pvt Ltd'}:\n${rowsBlock}\n\nAudit EVERY row and return exact structured classifications.`,
-      config: {
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-        systemInstruction: `You are the 1Pay Enterprise Fleet Reconciliation & NPCI NETC Compliance Auditor.
-Audit every transaction strictly against the provided Knowledge Base chunks:
-- Use ONLY these 4 classifications: COMPLIANT, DISPUTE_ELIGIBLE, POLICY_VIOLATION, HOLD_PENDING.
-- Classification guidance grounded in the KB:
-  * Duplicate settled toll debit within 10 minutes at same plaza for same vehicle with distinct RRNs (the second/duplicate leg) -> DISPUTE_ELIGIBLE, cite DOC-101, chargeback_code: "NETC-DUP-01", dispute_actionable: true. (The first original normal toll leg is COMPLIANT, citing DOC-101 or DOC-102 as verified primary debit.)
-  * Annual Pass applied on State Highway (SH), municipal parking, or private expressway -> POLICY_VIOLATION, cite DOC-102, chargeback_code: "NETC-PASS-EXCL", dispute_actionable: true (requires wallet re-billing / SLA adjustment packet).
-  * Exception Code 08 (E-Notice / Blacklist) 2x penalty -> POLICY_VIOLATION, cite DOC-103, chargeback_code: "NETC-EX08-BLOCKED", dispute_actionable: true (packet explains regularization prerequisite before any dispute).
-  * Corporate fuel card swipe > ₹5,000 with GST invoice AND within 25 km on-route -> COMPLIANT, cite DOC-104, chargeback_code: "N/A", dispute_actionable: false.
-  * Corporate fuel card swipe > ₹5,000 off-corridor (>25 km) and/or missing GST invoice -> POLICY_VIOLATION, cite DOC-104, chargeback_code: "1PAY-SLA-FUEL-HOLD", dispute_actionable: true (Fleet Admin hold & compliance memo).
-  * Settlement status PENDING -> HOLD_PENDING, cite DOC-106, chargeback_code: "HOLD-UNSETTLED", dispute_actionable: true (pre-arbitration hold memo blocking chargeback until POSTED).
-  * Normal settled NH toll -> COMPLIANT, cite DOC-102 (valid NH toll) or DOC-106 (settled POSTED status), chargeback_code: "N/A", dispute_actionable: false.
-- Every single row MUST have a valid primary_citation matching an exact chunk_id from the Knowledge Base (e.g., "DOC-101") and non-empty cited_chunks array.
-- Keep rationale concise (1-2 sharp sentences) and strictly grounded in the cited policy text.`,
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            results: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  txn_id: { type: Type.STRING },
-                  classification: {
-                    type: Type.STRING,
-                    enum: ['COMPLIANT', 'DISPUTE_ELIGIBLE', 'POLICY_VIOLATION', 'HOLD_PENDING'],
-                  },
-                  primary_citation: { type: Type.STRING },
-                  cited_chunks: {
-                    type: Type.ARRAY,
-                    items: { type: Type.STRING },
-                  },
-                  chargeback_code: { type: Type.STRING },
-                  rationale: { type: Type.STRING },
-                  recommended_action: { type: Type.STRING },
-                  dispute_actionable: { type: Type.BOOLEAN },
-                },
-                required: [
-                  'txn_id',
-                  'classification',
-                  'primary_citation',
-                  'cited_chunks',
-                  'chargeback_code',
-                  'rationale',
-                  'recommended_action',
-                  'dispute_actionable',
-                ],
-              },
-            },
+      systemInstruction: AUDIT_SYSTEM_INSTRUCTION,
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          results: {
+            type: Type.ARRAY,
+            items: AUDIT_ROW_ITEM_SCHEMA,
           },
-          required: ['results'],
         },
+        required: ['results'],
       },
     });
 
-    const parsed = JSON.parse((response.text ?? '{"results":[]}').trim()) as {
+    const parsed = JSON.parse(text) as {
       results: Omit<RowAuditResult, 'retrieved_chunks'>[];
     };
 
@@ -432,7 +595,7 @@ Audit every transaction strictly against the provided Knowledge Base chunks:
     const payload: BatchAuditResponse = {
       batch_id: batch_id ?? 'BATCH-NETC-2026-1119',
       client_name: client_name ?? 'Apex Freight Carriers Pvt Ltd',
-      model: TEXT_MODEL,
+      model: modelUsed,
       latency_ms: Date.now() - start,
       audited_at: new Date().toISOString(),
       results: enrichedResults,
@@ -475,8 +638,7 @@ apiRouter.post('/dispute-packet', async (req, res) => {
       ? `\nRelated Counterpart Transaction:\n${relatedTransaction.txn_id} | Vehicle: ${relatedTransaction.vehicle_reg} | Plaza: ${relatedTransaction.plaza_or_merchant} | Amount: ₹${relatedTransaction.amount_inr} | Time: ${relatedTransaction.timestamp} | RRN: ${relatedTransaction.rrn} | Status: ${relatedTransaction.settlement_status}`
       : '';
 
-    const response = await ai.models.generateContent({
-      model: TEXT_MODEL,
+    const { text } = await generateWithFallback(ai, {
       contents: `Client Entity: ${client_name ?? 'Apex Freight Carriers Pvt Ltd'} (GSTIN: 27AABCA8921F1Z5)
 Flagged Transaction:
 ${transaction.txn_id} | Vehicle: ${transaction.vehicle_reg} | Plaza/Merchant: ${transaction.plaza_or_merchant} | Amount: ₹${transaction.amount_inr} | Status: ${transaction.settlement_status} | Timestamp: ${transaction.timestamp} | RRN: ${transaction.rrn} | Corridor: ${transaction.corridor_note} | Notes: ${transaction.notes}${relatedInfo}
@@ -490,9 +652,7 @@ Governing Policy Clauses:
 ${policyBlock}
 
 Generate a formal B2B NPCI NETC / 1Pay SLA Dispute & Compliance Memo.`,
-      config: {
-        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-        systemInstruction: `You draft formal, audit-ready B2B NPCI NETC Chargeback & 1Pay Fleet SLA Compliance Memos for Indian commercial fleet operators.
+      systemInstruction: `You draft formal, audit-ready B2B NPCI NETC Chargeback & 1Pay Fleet SLA Compliance Memos for Indian commercial fleet operators.
 - Cite ONLY the provided policy chunks using exact [DOC-XXX] identifiers.
 - Reflect exact eligibility rules:
   * Duplicate settled toll (DOC-101): ELIGIBLE_FOR_FILING with reason code NETC-DUP-01 within 15 days.
@@ -500,58 +660,56 @@ Generate a formal B2B NPCI NETC / 1Pay SLA Dispute & Compliance Memo.`,
   * Exception Code 08 penalty (DOC-103): REGULARIZATION_REQUIRED (cannot be disputed until KYC/balance is regularized).
   * Off-corridor fuel without GST (DOC-104) or State Highway Annual Pass violation (DOC-102): BLOCKED_HOLD_REQUIRED or REGULARIZATION_REQUIRED with clear Fleet Admin sign-off / wallet re-billing directives.
 - Always ground SLA resolution TAT in DOC-105 (3–5 working days Level 1, 8–10 business days Level 2 before Nodal Officer escalation).`,
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            filing_authority: { type: Type.STRING },
-            chargeback_code: { type: Type.STRING },
-            eligibility_status: {
-              type: Type.STRING,
-              enum: ['ELIGIBLE_FOR_FILING', 'BLOCKED_HOLD_REQUIRED', 'REGULARIZATION_REQUIRED'],
-            },
-            sla_timeline: { type: Type.STRING },
-            subject_line: { type: Type.STRING },
-            executive_summary: { type: Type.STRING },
-            policy_citations: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  chunk_id: { type: Type.STRING },
-                  source_doc: { type: Type.STRING },
-                  clause_application: { type: Type.STRING },
-                },
-                required: ['chunk_id', 'source_doc', 'clause_application'],
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          filing_authority: { type: Type.STRING },
+          chargeback_code: { type: Type.STRING },
+          eligibility_status: {
+            type: Type.STRING,
+            enum: ['ELIGIBLE_FOR_FILING', 'BLOCKED_HOLD_REQUIRED', 'REGULARIZATION_REQUIRED'],
+          },
+          sla_timeline: { type: Type.STRING },
+          subject_line: { type: Type.STRING },
+          executive_summary: { type: Type.STRING },
+          policy_citations: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                chunk_id: { type: Type.STRING },
+                source_doc: { type: Type.STRING },
+                clause_application: { type: Type.STRING },
               },
-            },
-            formal_narrative: { type: Type.STRING },
-            required_annexures: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING },
-            },
-            escalation_steps: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING },
+              required: ['chunk_id', 'source_doc', 'clause_application'],
             },
           },
-          required: [
-            'filing_authority',
-            'chargeback_code',
-            'eligibility_status',
-            'sla_timeline',
-            'subject_line',
-            'executive_summary',
-            'policy_citations',
-            'formal_narrative',
-            'required_annexures',
-            'escalation_steps',
-          ],
+          formal_narrative: { type: Type.STRING },
+          required_annexures: {
+            type: Type.ARRAY,
+            items: { type: Type.STRING },
+          },
+          escalation_steps: {
+            type: Type.ARRAY,
+            items: { type: Type.STRING },
+          },
         },
+        required: [
+          'filing_authority',
+          'chargeback_code',
+          'eligibility_status',
+          'sla_timeline',
+          'subject_line',
+          'executive_summary',
+          'policy_citations',
+          'formal_narrative',
+          'required_annexures',
+          'escalation_steps',
+        ],
       },
     });
 
-    const parsed = JSON.parse((response.text ?? '{}').trim()) as Omit<
+    const parsed = JSON.parse(text) as Omit<
       DisputePacket,
       'memo_id' | 'generated_at' | 'txn_id' | 'vehicle_reg' | 'latency_ms'
     >;
@@ -661,9 +819,14 @@ apiRouter.post('/run-evals', async (req, res) => {
       },
     ];
 
+    // Pre-warm chunk embeddings once before running all 5 eval cases
+    await ensureChunkEmbeddings(ai, chunks);
+    const modelsUsed = new Set<string>();
+
     const caseResults: EvalCaseTrace[] = await Promise.all(
       evalDefinitions.map(async (def) => {
         const ragRes = await runSingleRagQuery(ai, def.query, chunks);
+        modelsUsed.add(ragRes.model);
         const inlineCitations = extractInlineCitations(ragRes.answer);
         const allCited = Array.from(new Set([...ragRes.cited_chunk_ids, ...inlineCitations]));
         const top2Ids = ragRes.retrieved_chunks.slice(0, 2).map((c) => c.chunk_id);
@@ -738,7 +901,7 @@ apiRouter.post('/run-evals', async (req, res) => {
     const payload: EvalSuiteResponse = {
       run_id: `EVAL-RUN-${Date.now().toString().slice(-6)}`,
       executed_at: new Date().toISOString(),
-      model: TEXT_MODEL,
+      model: Array.from(modelsUsed).join(', ') || PRIMARY_TEXT_MODEL,
       embedding_model: EMBEDDING_MODEL,
       total_cases: totalCases,
       passed_cases: passedCases,

@@ -37,6 +37,20 @@ export function runBatchAuditApi(payload: {
   return postJson<BatchAuditResponse>('/api/audit-batch', payload);
 }
 
+export function runSingleRowAuditApi(payload: {
+  transaction: FleetTransaction;
+  allTransactions: FleetTransaction[];
+  chunks: PolicyChunk[];
+  client_name: string;
+}): Promise<{
+  result: RowAuditResult;
+  model: string;
+  latency_ms: number;
+  audited_at: string;
+}> {
+  return postJson('/api/audit-row', payload);
+}
+
 export function generateDisputePacketApi(payload: {
   transaction: FleetTransaction;
   auditResult: RowAuditResult;
