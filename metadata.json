@@ -1,0 +1,6 @@
+{
+  "name": "1Pay Enterprise — Fleet Reconciliation & NETC Compliance Suite",
+  "description": "Enterprise B2B SaaS operations suite for NPCI NETC toll reconciliation, corporate fuel card compliance auditing, RAG policy retrieval, automated dispute packet generation, and citation accuracy evaluations.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
